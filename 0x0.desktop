@@ -1,0 +1,4 @@
+[Desktop Entry]
+Type=Application
+Exec=kitty sh -c '0x0 %f; echo "Press any key to exit..."; read -n 1'
+Name=0x0

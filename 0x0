@@ -1,0 +1,322 @@
+#!/bin/bash
+
+# The MIT License (MIT)
+#
+# Copyright (c) 2023 Andy Russo
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+[ -n "$XDG_CONFIG_HOME" ] && config_path="$XDG_CONFIG_HOME/0x0.sh" || config_path='~/.config/0x0.sh'
+[ -n "$XDG_DATA_HOME" ] && tokens_path="$XDG_DATA_HOME/0x0_tokens" || tokens_path='~/.local/share/0x0_tokens'
+
+print_help() {
+    cat << EOF
+Usage:
+  0x0 [upload] [OPTION]... FILE
+  0x0 delete URL [TOKEN]
+  0x0 expire URL TIME [TOKEN]
+
+0x0 upload bash script implementing the full 0x0 API and extra QoL.
+
+Upload a FILE (can be a URL) to https://0x0.st.
+Or delete a URL, optionally using TOKEN.
+Or set expiry date of a URL to TIME,
+optionally using TOKEN.
+
+Delete and expire commands try
+to find the URL inside the tokens file,
+so you could end up with more than one match,
+in which case the script will use the latest token.
+If a TOKEN is provided, it will be used instead,
+but URL must be a valid URL.
+
+Config stored at "$config_path".
+Tokens file stored at "$tokens_path".
+
+Commands:
+  upload (default if omitted)
+  delete
+  expire sets expiry date
+
+Options for upload:
+  -h,   --help      show this help message.
+  -e,   --embed     wrap with https://embeds.video to embed videos >50 MB on discord.
+  -ne,  --no-embed  do not wrap output with https://embeds.video. (default)
+  -s,   --secret    enables secret filename. (0x0.st/s/*/filename)
+  -ns,  --no-secret disables secret filename. (default)
+  -ex,  --expire    expire time in hours or epoch milliseconds, 0 for unset.
+  -nex, --no-expire do not expire, same as "--expire 0". (default)
+
+Examples:
+  0x0 upload video.mp4
+  0x0 -s --no-expire -e video.mp4 (results in https://0x0.st/abcd.mp4 for examples)
+  0x0 expire abcd.mp4 10 (looked up URL and token in the tokens file)
+  0x0 expire https://0x0.st/abcd.mp4 10 MfOaB8Yf7SADSlkR3NJKbNT99Idt9t09gyHfDsOlkrU
+  0x0 delete abcd (look up by incomplete string)
+  0x0 delete MfOaB8Yf7SADSlkR3NJKbNT99Idt9t09gyHfDsOlkrU (look up by token)
+EOF
+
+    exit
+}
+
+generate_config() {
+    echo 'Generating default config.'
+
+    cat << EOF > "$config_path"
+# Config file for 0x0.
+# Command line options have a priority over the config.
+# Options are either of: "true", "false", number, URL in quotes.
+
+# Wrap output with https://embeds.video to embed videos >50 MB megabytes on discord.
+embed=false
+# Use secret filename.
+secret=false
+# Default expiry period in hours for uploads, 0 for unset.
+expiry=0
+
+# Set an alternative 0x0 instance's URL ending with "/".
+instance="https://0x0.st/"
+EOF
+}
+
+strip_newline() {
+    echo "${1//[$'\t\r\n']}"
+}
+
+get_word() {
+    awk "{print \$$2}" <<< $1
+}
+
+validate_expiry() {
+    case "$1" in
+        '')
+            echo 'Expiry time was not provided.' ;&
+        *[!0-9]*)
+            echo "Expected a positive integer or 0 for expiry, got \"$1\"." ;&
+        '' | *[!0-9]*) exit 1 ;;
+    esac
+}
+
+is_link() {
+    [ -n "$(grep 'https\?://' <<< "$1")" ]
+    return $?
+}
+
+set_token_link() {
+    if [ -n "$2" ]; then
+        if ! is_link "$1"; then
+            echo "\"$1\" is not a valid link."
+            exit 1
+        fi
+
+        token="$2"
+        link="$1"
+    else
+        line=$(grep --fixed-strings "$1" "$tokens_path")
+
+        if [ -z "$line" ]; then
+            echo "Link \"$1\" not found in the tokens file."
+            exit 1
+        elif [ $(wc --lines <<< "$line") -gt 1 ]; then
+            echo -e "More than one link have been matched.\nUsing newest relevant token.\nIf this token is invalid consider checking the tokens file manually."
+            line="$(tail -n 1 <<< "$line")"
+        fi
+
+        line=$(strip_newline "$line")
+
+        link=$(get_word "$line" 1)
+        token=$(get_word "$line" 2)
+    fi
+}
+
+check_exit_code() {
+    if [ $1 -gt 400 ]; then
+        if [ $1 -eq 404 ]; then
+            echo 'File not found. It has been probably been deleted.'
+        elif [ $1 -eq 401 ]; then
+            echo 'The token for this file is invalid.'
+        else
+            echo "Unexpected error \"$1\", please report this."
+        fi
+
+        exit $1
+    fi
+}
+
+delete() {
+    set_token_link $@
+
+    http_code=$(
+    curl \
+        -# \
+        -o /dev/null \
+        -w '%{http_code}' \
+        -Ftoken="$token" \
+        -Fdelete= \
+        "$link"
+    )
+
+    check_exit_code $http_code
+
+    echo 'File deleted successfully!'
+    exit 0
+}
+
+expire() {
+    set_token_link "$1" "$3"
+    validate_expiry "$2"
+
+    http_code=$(
+    curl \
+        -# \
+        -o /dev/null \
+        -w '%{http_code}' \
+        -Ftoken="$token" \
+        -Fexpires=$2 \
+        "$link"
+    )
+
+    check_exit_code $http_code
+
+    echo 'File expiry changed successfully!'
+    exit 0
+}
+
+[ "$#" -eq 0 ] && print_help
+
+[ ! -f "$config_path" ] && generate_config
+
+source "$config_path"
+
+case "$1" in
+    upload | delete | expire)
+        shift
+
+        [ "$#" -eq 0 ] && print_help ;;&
+    delete)
+        if [ "$#" -gt 2 ]; then
+            echo 'Too many arguments.'
+            exit 1
+        fi
+
+        delete "$@" ;;
+    expire)
+        if [ "$#" -gt 3 ]; then
+            echo 'Too many arguments.'
+            exit 1
+        fi
+
+        expire "$@" ;;
+esac
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h | --help)
+            print_help ;;
+        -e | --embed)
+            embed=true ;;
+        -ne | --no-embed)
+            embed=false ;;
+        -s | --secret)
+            secret=true ;;
+        -ns | --no-secret)
+            secret=false ;;
+        -ex | --expire)
+            shift
+
+            validate_expiry "$1"
+
+            expiry=$1 ;;
+        -nex | --no-expire)
+            expiry= ;;
+        -*)
+            echo "Invalid argument \"$1\"."
+            exit 1 ;;
+        *)
+            if [ -n "$filepath" ]; then
+                echo 'Only one file can be uploaded at a time.'
+                exit 1
+            elif [ ! -f "$1" ] && ! is_link "$1"; then
+                echo "File \"$1\" does not exist."
+                exit 1
+            fi
+
+            filepath="$1" ;;
+    esac
+
+    shift
+done
+
+if is_link "$filepath"; then
+    options="-Furl=\"$filepath\""
+else
+    options="-Ffile=@\"$filepath\""
+fi
+
+[ "$secret" = true ] || secret=
+[ "$expiry" -gt 0 ] &> /dev/null || expiry=
+
+output=$(
+curl \
+    --fail-with-body \
+    --progress-bar \
+    -i \
+    ${secret:+-Fsecret=} \
+    ${expiry:+-Fexpires=$expiry} \
+    "$options" \
+    "$instance"
+)
+
+res=$?
+if [ $res -ne 0 ]; then
+    echo "There was an error while uploading..."
+    echo "$output"
+
+    exit $res
+fi
+
+link=$(grep --fixed-strings "$instance" <<< $output)
+
+token=$(grep "x-token" <<< $output | sed "s/x-token: //")
+# Remove newline because it creates a weird tokens file
+link=$(strip_newline "$link")
+token=$(strip_newline "$token")
+if [ -z $token ]; then
+    token="This file has been uploaded before, hence there is no token for this upload.\nThis will not be recorded in the tokens file."
+else
+    # Concatenate link and token
+    export token_to_file="${link} ${token}"
+    # Store token and link for deletion later
+    printenv token_to_file >> $tokens_path
+fi
+
+if [ "$embed" = true ]; then
+    [ "$instance" = 'https://0x0.st/' ] \
+        && link="https://embeds.video/0x0/$(cut -d / -f 4- <<< $link)" \
+        || link="https://embeds.video/$link"
+fi
+
+# Copy the link to clipboard
+# Not using a herestring (<<<) because it adds a newline for some reason
+echo -n "$link" | xsel -i -b
+
+echo 'Upload successful!'
+echo -e "$token\n"
+echo "$link"
+
